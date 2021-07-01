@@ -1,0 +1,368 @@
+---
+title: "Abundance Summary"
+author: "Matt Weldy"
+date: "6/30/2021"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(readr)
+library(move)
+library(R2jags)
+library(knitr)
+library(ggplot2)
+```
+
+## Count data preparation
+
+Here I load in the count data cleaned by Zach and Amy. This has a column in it specifying the cumulative number of elephants in a group per cluster of photographs, which is important to reduce cluster sizes to appropriate numbers if elephants were moving slowly in front of the cameras. 
+
+This data read ends by splitting the data frame into a list of smaller data frames grouped by site and week. 
+
+```{r}
+elephant_groups_cleaned <- read_excel("../data/raw/Nkhotakota collar data/elephant_groups_cleaned_062121.xlsx", 
+                                      sheet = "elephant_groups_cleaned_062121",
+                                      na= "NA")
+elephant_groups_cleaned$`Group size cumulative` <- as.numeric(elephant_groups_cleaned$`Group size cumulative`)
+
+# Load original DF with sampling zeros
+y <- read_excel("../data/raw/dh_Elephant.xlsx", 
+                sheet = "clean_station_count",
+                col_types = c("text", 
+                              rep("numeric",99)),
+                 na= "NA")
+
+#group by site and week strata and split into a list of dfs
+g_elephant_groups_cleaned <-  elephant_groups_cleaned %>% 
+  group_by(site,WK) %>%  
+  split(group_indices(.))
+```
+
+Here I created a new long-form empty data frame filled with NA values, then thinned the count data to 1 hour detection clusters and used the cumulative number of elephants detected as the cluster size. I consolidated the list of dataframes back into a single data frame at the end.
+
+```{r}
+# empty storage df 
+CH <- data.frame(site = rep(NA,length(g_elephant_groups_cleaned)), week = rep(NA,length(g_elephant_groups_cleaned)) , count = rep(NA,length(g_elephant_groups_cleaned)))
+
+delta <- 60 #thinning interval
+for(i in 1:length(g_elephant_groups_cleaned)){#length(g_elephant_groups_cleaned)
+  CH$site[i] <- g_elephant_groups_cleaned[[i]]$site[[1]]
+  CH$week[i] <- g_elephant_groups_cleaned[[i]]$WK[[1]]
+  CH$count[i] <- ifelse(!is.na(g_elephant_groups_cleaned[[i]]$`Group size cumulative`[[1]]),g_elephant_groups_cleaned[[i]]$`Group size cumulative`[[1]],1)
+  
+  cluster_num <- 1
+  g_elephant_groups_cleaned[[i]]$cluster_num <- cluster_num
+  
+  if(nrow(g_elephant_groups_cleaned[[i]]) > 1) {
+    for(j in 2:nrow(g_elephant_groups_cleaned[[i]])){
+      if(as.numeric((g_elephant_groups_cleaned[[i]]$actualDate[j] - g_elephant_groups_cleaned[[i]]$actualDate[j-1]), units = "mins") > delta){
+        cluster_num <- cluster_num + 1
+        g_elephant_groups_cleaned[[i]]$cluster_num[j:nrow(g_elephant_groups_cleaned[[i]])] <- cluster_num
+        if(!is.na(g_elephant_groups_cleaned[[i]]$`Group size cumulative`[[j]])) CH$count[i] <- CH$count[i] + g_elephant_groups_cleaned[[i]]$`Group size cumulative`[[j]]
+      }
+    }
+    
+  }
+}
+
+# Pull the list into a common df
+rbound_elephant_groups_cleaned <- do.call("rbind",g_elephant_groups_cleaned)
+
+```
+
+Building a data frame to detect the average elephant cluster size. 
+
+```{r, message=FALSE}
+# build df to get mean group sizes after detecting temporal clusters at 1 hr
+mean_cluster_size <- rbound_elephant_groups_cleaned %>% 
+  group_by(site,WK,cluster_num) %>% 
+  summarise(mean=mean(`Group size cumulative`,na.rm=TRUE))
+# mean group size
+groupsize <- mean(mean_cluster_size$mean,na.rm=TRUE)
+```
+
+Mean group size is `groupsize`.
+
+Here I use the sampling zeros from the data frame I was originally sent, but I replace all the count values with those from the cleaned data set. 
+
+```{r}
+# Corrected count values clustered at 1 hr intervals used to replace duplicated counts in the original data
+y_corrected <- CH %>% pivot_wider( names_from = week,values_from = count)
+names(y_corrected) <- c("site",paste0("w_",names(y_corrected[-1]))) #correct col names for string searches
+
+# Replace duplicate values in y
+for(i in 1:nrow(y_corrected)){
+  row <- which(y$site == y_corrected$site[i])
+  for(j in 2:ncol(y_corrected)){
+    if(!is.na(y_corrected[i,j]) && y_corrected[i,j]>0)y[row,which(names(y) == names(y_corrected)[j])] <- y_corrected[i,j]
+  }
+}
+```
+
+## Estimating average movement speed 
+
+Here I read in all of the collar data, create a move type object and estimate speed. 
+
+```{r, message=FALSE}
+Combined_collar_data <- read_delim("../data/raw/Nkhotakota collar data/Combined_collar_data_csv.csv", ",", escape_double = FALSE, trim_ws = TRUE)
+Combined_collar_data$id <- paste0(Combined_collar_data$Elephant,"_",format(Combined_collar_data$Time, format="%Y"),"_",format(Combined_collar_data$Time, format="%m"))
+data <- move(x=Combined_collar_data$dde, 
+             y=Combined_collar_data$dds,
+             time=as.POSIXct(Combined_collar_data$Time, format="%Y-%m-%d %H:%M:%S", tz="CAT"),
+             proj=  CRS(SRS_string="OGC:CRS84"),
+             # proj= CRS(SRS_string="EPSG:WGS84"),
+             # proj=CRS("+proj=longlat +ellps=WGS84"),
+             animal=Combined_collar_data$id
+)
+
+V <-  mean(unlist(speed(data))) *60*60*24*7*0.001
+```
+
+Average speed is `V` km / week.
+
+## Abundance estimators
+
+The moment estimator is a ratio based estimator. Confidence intervals can be obtained via bootstrapping. I am using the manufacturers camera specification for detection angle (theta = 45 degrees or 0.785 radians) and detection distance (radius = 18.288 m). 
+
+```{r}
+theta <- 0.785398 # radians
+radius <- 0.018288 # 18.288 m
+t <- 1
+A <- ((2 + theta)/pi)*radius*t
+denisty_REM  <- (mean(as.matrix(y[,-1]), na.rm=TRUE)/A/ V)
+N <- denisty_REM * 780 * groupsize 
+```
+The moments estimator with the manufacturers setting estimates `N` elephants in the 780 km^2 fenced southern preserve. 
+
+We are uncertain about the realized detection radius and it is unlikely that we are sampling the manufacturers distance at every station. Below I fit four parametric estimators which allow prior estimates for detection radius. I will fit two estimators for both the Poisson and negative binomial distributions. The first estimator will use a fixed, mean prior for detection distance which will use a prior from the normal distribution with $\mu = 14 m$ and $\sigma = 1 m$. The second assumes that detection distances vary by site and uses a random intercept parameterization which places a uniform prior from 10-20 m on each station. 
+
+The Poisson estimates should be interpreted with caution because our mean is much smaller than our variance. 
+
+```{r}
+# Should we consider the NB model over the Poisson?
+mean(as.matrix(y[,-1]), na.rm=TRUE) < var(unlist(y[,-1]), na.rm=TRUE)
+```
+Data for all of the JAGS models. 
+
+```{r}
+
+data <- list(
+  y = as.matrix(y[,-1]),
+  V = V,
+  theta = theta, 
+  t = 1,
+  pie = pi,
+  n_camera = nrow(y),
+  n_visit = ncol(y)-1,
+  groupsize = groupsize
+)
+
+```
+
+### Poisson estimators
+#### Mean detection distance 
+```{r, results='hide', warning=FALSE, message=FALSE, cache=TRUE}
+
+modelstring <- textConnection(
+  "
+	  model{
+	  radius ~ dnorm(0.014, tau_r)
+	  sd_r <- 0.001
+	  tau_r <- pow(sd_r,-2)
+
+	  density ~ dunif(0,10)
+	  
+		A <- radius*t*((2+theta)/pie)
+	  lambda <- A*V*density
+		
+		for (i in 1:n_camera) {
+		  for (j in 1:n_visit) {
+		    y[i,j] ~ dpois(lambda)
+		  }
+		}
+		N <- density*780*groupsize
+    }
+	"
+)
+parameters <- c("density","radius", "N")
+
+inits <- function() {
+  list()
+}
+ni <- 5000
+nt <- 1
+nb <- ni/2
+nc <- 3
+Model_mean <- jags(data, inits, parameters, modelstring, n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb)
+
+```
+
+#### Random effect detection distance 
+```{r, results='hide', warning=FALSE, message=FALSE, cache=TRUE}
+
+
+modelstring <- textConnection(
+  "
+	  model{
+	
+	  density ~ dunif(0,10)
+	  
+    for (i in 1:n_camera) {
+      radius[i] ~ dunif(0.01,0.02)
+      A[i] <- radius[i]*t*((2+theta)/pie)
+      lambda[i] <- A[i]*V*density
+    }
+		
+		for (i in 1:n_camera) {
+		  for (j in 1:n_visit) {
+		    y[i,j] ~ dpois(lambda[i])
+		  }
+		}
+		N <- density*780*groupsize
+    }
+	"
+)
+parameters <- c("density","radius", "N")
+
+inits <- function() {
+  list()
+}
+ni <- 5000
+nt <- 1
+nb <- ni/2
+nc <- 3
+Model_RE <- jags(data, inits, parameters, modelstring, n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb)
+
+```
+### Negative binomial estimators
+#### Mean detection distance 
+```{r, results='hide', warning=FALSE, message=FALSE, cache=TRUE}
+
+modelstring <- textConnection(
+  "
+	  model{
+    radius ~ dnorm(0.014, tau_r)
+	  sd_r <- 0.001
+	  tau_r <- pow(sd_r,-2)
+	  density ~ dunif(0,10)
+	  
+	  r ~ dunif(0,50)
+
+		A <- radius*t*((2+theta)/pie)
+	  lambda <- A*V*density
+	  p <- r/(r+lambda)
+	
+		for (i in 1:n_camera) {
+		  for (j in 1:n_visit) {
+		    y[i,j] ~ dnegbin(p,r)
+		  }
+		}
+		N <- density*780*groupsize
+    }
+	"
+)
+parameters <- c("density","radius", "r","N")
+
+inits <- function() {
+  list()
+}
+ni <- 5000
+nt <- 1
+nb <- ni/2
+nc <- 3
+NB_Model_mean <- jags(data, inits, parameters, modelstring, n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb)
+
+```
+
+#### Random effect detection distance 
+```{r, results='hide', warning=FALSE, message=FALSE, cache=TRUE}
+modelstring <- textConnection(
+  "
+	  model{
+
+	  density ~ dunif(0,10)
+	  
+	  r ~ dunif(0,50)
+	  
+		for (i in 1:n_camera) {
+  		radius[i] ~ dunif(0.01,0.02)
+      A[i] <- radius[i]*t*((2+theta)/pie)
+      lambda[i] <- A[i]*V*density
+	  	p[i] <- r/(r+lambda[i])
+		}
+	
+		for (i in 1:n_camera) {
+		  for (j in 1:n_visit) {
+		    y[i,j] ~ dnegbin(p[i],r)
+		  }
+		}
+		N <- density*780*groupsize
+    }
+	"
+)
+parameters <- c("density","radius", "r","N")
+
+inits <- function() {
+  list()
+}
+ni <- 5000
+nt <- 1
+nb <- ni/2
+nc <- 3
+NB_Model_RE <- jags(data, inits, parameters, modelstring, n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb)
+
+```
+
+## Estimates table
+```{r}
+results_df <- data.frame(estimator = c("Moment", "Poisson mean", "Poisson RE", "NB mean" ,"NB RE"),
+                         mean = c(N,
+                                  Model_mean$BUGSoutput$summary["N","mean"],
+                                  Model_RE$BUGSoutput$summary["N","mean"],
+                                  NB_Model_mean$BUGSoutput$summary["N","mean"],
+                                  NB_Model_RE$BUGSoutput$summary["N","mean"]),
+                         lcl = c("NA",
+                                  Model_mean$BUGSoutput$summary["N","2.5%"],
+                                  Model_RE$BUGSoutput$summary["N","2.5%"],
+                                  NB_Model_mean$BUGSoutput$summary["N","2.5%"],
+                                  NB_Model_RE$BUGSoutput$summary["N","2.5%"]),
+                         ucl = c("NA",
+                                  Model_mean$BUGSoutput$summary["N","97.5%"],
+                                  Model_RE$BUGSoutput$summary["N","97.5%"],
+                                  NB_Model_mean$BUGSoutput$summary["N","97.5%"],
+                                  NB_Model_RE$BUGSoutput$summary["N","97.5%"]))
+
+
+knitr::kable(results_df)
+```
+
+## Estimated dectection distances from RE models
+```{r}
+poisson_summary <- Model_RE$BUGSoutput$summary
+radius_rows <- grepl(rownames(poisson_summary), pattern = "^radius\\[")
+poisson_radii <- data.frame(model = "Poisson", mean = poisson_summary[radius_rows, "mean"])
+
+
+NB_summary <- NB_Model_RE$BUGSoutput$summary
+radius_rows <- grepl(rownames(NB_summary), pattern = "^radius\\[")
+NB_radii <- data.frame(model = "NB", mean = NB_summary[radius_rows, "mean"])
+
+plot_df <- as.data.frame(rbind(poisson_radii, NB_radii))
+
+plot_df %>% 
+  ggplot(aes(x = mean, fill = model)) + 
+  geom_density(alpha=.2) +
+  theme_classic() +
+  scale_x_continuous(breaks = c(0.0125, 0.015, 0.0175, 0.020), labels = c(12.5, 15, 17.5, 20))+
+  xlab("Detection distance (m)") 
+```
+
